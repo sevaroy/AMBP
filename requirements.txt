@@ -1,3 +1,9 @@
+cmake
+build
+setuptools
+wheel
+numpy
+dlib==19.24.6 --prefer-binary
 streamlit
 pillow
 requests
