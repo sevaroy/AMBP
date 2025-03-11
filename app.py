@@ -1,985 +1,1038 @@
 import os
-import base64
-import requests
-import replicate
-from PIL import Image
-import io
-from dotenv import load_dotenv
-import matplotlib.pyplot as plt
-import numpy as np
-from matplotlib.colors import LinearSegmentedColormap
-import cv2
-import datetime
 import tempfile
+import datetime
+import logging
+import re
+import base64
 import time
+from typing import Optional, Tuple
+from PIL import Image as PILImage
+import io
+import numpy as np
+import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
+import cv2
+from dotenv import load_dotenv
 import streamlit as st
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
+import plotly.express as px
+from openai import OpenAI
+import concurrent.futures
+import sqlite3
+import json
+import dlib
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as ReportLabImage
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.lib import colors
+from io import BytesIO
+from fpdf import FPDF
 
-# 加载环境变量
+# 配置日誌
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# 環境變量加載
 load_dotenv()
-
-# 获取API密钥
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+XAI_API_KEY = os.getenv("XAI_API_KEY")
 
-# 页面配置
+if not DEEPSEEK_API_KEY or not XAI_API_KEY:
+    st.error("環境變量 DEEPSEEK_API_KEY 或 XAI_API_KEY 未設置，請檢查 .env 文件")
+    logger.error("API 密鑰缺失")
+    logger.info(f"DEEPSEEK_API_KEY: {DEEPSEEK_API_KEY}")
+    logger.info(f"XAI_API_KEY: {XAI_API_KEY}")
+    st.stop()
+
+# 初始化 OpenAI 客戶端（用於 DeepSeek R1）
+deepseek_client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
+
+# 初始化 xAI 客戶端（用於 Grok-2-Vision-1212）
+xai_client = OpenAI(api_key=XAI_API_KEY, base_url="https://api.x.ai/v1")
+
+# Streamlit 頁面配置
 st.set_page_config(
-    page_title="AI医美智能评估系统",
+    page_title="醫美診所智能評估系統",
     page_icon="💉",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-# 标题和介绍
-st.title("AI医美智能评估系统 - 专业版")
-st.markdown("上传您的正面照片，获取专业医美建议")
+# 自定義 CSS 主題
+st.markdown("""
+<style>
+    /* 主色調 */
+    :root {
+        --primary-color: #9C89B8;       /* 淺紫主色調 */
+        --primary-light: #F0E6FF;       /* 淺紫背景色 */
+        --secondary-color: #F0A6CA;     /* 柔粉輔助色 */
+        --accent-color: #B8BEDD;        /* 淺藍點綴色 */
+        --neutral-dark: #5E6472;        /* 高級灰 */
+        --neutral-light: #F7F7FC;       /* 背景色 */
+        --success-color: #A0C4B9;       /* 成功提示色 */
+        --error-color: #E08F8F;         /* 錯誤提示色 */
+    }
+    
+    body { 
+        background-color: var(--neutral-light); 
+        font-family: 'Arial', 'Microsoft YaHei', sans-serif; 
+    }
+    
+    .stApp { background-color: var(--neutral-light); }
+    
+    h1 { 
+        color: var(--neutral-dark); 
+        font-size: 32px; 
+        font-weight: 600;
+        margin-bottom: 20px; 
+    }
+    
+    h2 { 
+        color: var(--neutral-dark); 
+        font-size: 24px; 
+        margin-bottom: 15px; 
+    }
+    
+    /* 卡片樣式優化 */
+    .card { 
+        background: white; 
+        padding: 25px; 
+        border-radius: 16px; 
+        box-shadow: 0 10px 30px rgba(0,0,0,0.05), 0 1px 8px rgba(0,0,0,0.02); 
+        margin-bottom: 25px; 
+        border: none;
+        transition: transform 0.3s ease, box-shadow 0.3s ease;
+        position: relative;
+        overflow: hidden;
+    }
+    
+    .card:hover {
+        transform: translateY(-5px);
+        box-shadow: 0 15px 35px rgba(0,0,0,0.08), 0 5px 15px rgba(0,0,0,0.04);
+    }
+    
+    /* 卡片頂部漸變裝飾 */
+    .card::before {
+        content: "";
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        height: 5px;
+        background: linear-gradient(90deg, var(--primary-color), var(--secondary-color), var(--accent-color));
+        border-radius: 5px 5px 0 0;
+    }
+    
+    /* 按鈕樣式 */
+    div.stButton > button { 
+        background: linear-gradient(135deg, var(--primary-color), var(--secondary-color)); 
+        color: white; 
+        border-radius: 12px; 
+        padding: 12px 24px; 
+        font-weight: 500; 
+        border: none;
+        transition: all 0.3s ease;
+        box-shadow: 0 4px 10px rgba(156, 137, 184, 0.3);
+    }
+    
+    div.stButton > button:hover { 
+        transform: translateY(-2px);
+        box-shadow: 0 6px 15px rgba(156, 137, 184, 0.4);
+    }
+    
+    /* 上傳區域美化 */
+    .stFileUploader { 
+        border: 2px dashed var(--primary-color); 
+        border-radius: 16px; 
+        padding: 20px; 
+        background-color: var(--primary-light);
+        transition: all 0.3s ease;
+    }
+    
+    .stFileUploader:hover {
+        border-color: var(--secondary-color);
+        background-color: rgba(240, 230, 255, 0.7);
+    }
+    
+    /* 統一圓角設計 */
+    .stImage, .stFileUploader, div.stButton > button,
+    .stTextInput > div > div > input,
+    .stSelectbox > div > div > select,
+    .stDateInput > div > div > input {
+        border-radius: 12px !important;
+    }
+    
+    /* 進度條美化 */
+    .stProgress > div > div > div {
+        background: linear-gradient(90deg, var(--primary-color), var(--secondary-color)) !important;
+        border-radius: 10px !important;
+    }
+    
+    .stProgress > div {
+        border-radius: 10px !important;
+        background-color: var(--primary-light) !important;
+    }
+    
+    /* 圖像容器美化 */
+    .stImage {
+        overflow: hidden;
+        box-shadow: 0 5px 15px rgba(0,0,0,0.08);
+        transition: transform 0.3s ease;
+    }
+    
+    .stImage:hover {
+        transform: scale(1.02);
+    }
+    
+    /* 頁面標題區域 */
+    .title-container {
+        text-align: center;
+        padding: 20px 0 30px 0;
+        margin-bottom: 30px;
+        position: relative;
+    }
+    
+    .title-container::after {
+        content: "";
+        position: absolute;
+        bottom: 0;
+        left: 50%;
+        transform: translateX(-50%);
+        width: 100px;
+        height: 3px;
+        background: linear-gradient(90deg, var(--primary-color), var(--secondary-color));
+        border-radius: 3px;
+    }
+    
+    /* 側邊欄美化 */
+    .sidebar .sidebar-content { 
+        background: linear-gradient(180deg, var(--neutral-light), var(--primary-light)); 
+        padding: 25px;
+        border-right: 1px solid rgba(0,0,0,0.05);
+    }
+    
+    /* 分析結果卡片 */
+    .result-card {
+        background: white;
+        border-radius: 16px;
+        padding: 20px;
+        margin-bottom: 20px;
+        box-shadow: 0 5px 15px rgba(0,0,0,0.05);
+        border-left: 5px solid var(--primary-color);
+    }
+    
+    /* 視覺化圖表容器 */
+    .chart-container {
+        background: white;
+        border-radius: 16px;
+        padding: 15px;
+        margin-bottom: 15px;
+        box-shadow: 0 5px 15px rgba(0,0,0,0.05);
+        transition: transform 0.3s ease;
+    }
+    
+    .chart-container:hover {
+        transform: translateY(-5px);
+    }
+    
+    /* 圖表標題 */
+    .chart-title {
+        font-size: 16px;
+        color: var(--neutral-dark);
+        text-align: center;
+        margin-bottom: 10px;
+        font-weight: 500;
+    }
+    
+    /* 頁腳美化 */
+    .footer { 
+        text-align: center; 
+        color: var(--neutral-dark); 
+        font-size: 13px; 
+        margin-top: 30px;
+        padding: 15px;
+        border-top: 1px solid rgba(0,0,0,0.05);
+    }
+    
+    /* 成功和錯誤提示美化 */
+    .stSuccess, .stInfo, .stWarning, .stError {
+        border-radius: 12px !important;
+        padding: 12px !important;
+    }
+    
+    .stSuccess {
+        background-color: rgba(160, 196, 185, 0.2) !important;
+        border-left: 5px solid var(--success-color) !important;
+    }
+    
+    .stError {
+        background-color: rgba(224, 143, 143, 0.2) !important;
+        border-left: 5px solid var(--error-color) !important;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-# 侧边栏 - 模型选择
-st.sidebar.title("系统设置")
-model_choice = st.sidebar.radio(
-    "选择分析模型",
-    ["GPT-4o", "DeepSeek VL2"]
-)
-
-# 设置中文字体支持
+# 設置中文字體
 try:
-    # 尝试使用系统中文字体
-    plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'SimSun', 'Arial Unicode MS']
-    plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
-except:
-    print("警告：无法设置中文字体")
+    plt.rcParams['font.sans-serif'] = ['SimHei']  # 使用 SimHei 支持中文
+    plt.rcParams['axes.unicode_minus'] = False  # 解決負號顯示問題
+except Exception as e:
+    logger.warning(f"設置中文字體失敗: {str(e)}，將使用默認字體")
 
-# 函数定义
-def analyze_with_gpt4o(image_file):
-    """使用GPT-4o进行面部特征分析"""
-    # 将图像转换为base64
-    image_data = image_file.getvalue()
-    base64_image = base64.b64encode(image_data).decode('utf-8')
-    
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {OPENAI_API_KEY}"
+# 支持多語言版本
+TRANSLATIONS = {
+    "zh": {
+        "skin_condition": "皮膚狀況",
+        "wrinkles": "皺紋",
+        "spots": "色斑",
+        # 其他翻譯...
+    },
+    "en": {
+        "skin_condition": "Skin Condition",
+        "wrinkles": "Wrinkles",
+        "spots": "Spots",
+        # 其他翻譯...
     }
-    
-    payload = {
-        "model": "gpt-4o",
-        "messages": [
-            {
-                "role": "system",
-                "content": "你是一位专业的医美顾问。请分析上传的面部照片，识别面部特征并提供详细的医美建议。请按照以下区域进行分析：额头、眼周、鼻子、颧骨、嘴唇、下巴。对每个区域的皮肤状况、皱纹、色斑、紧致度等进行0-5分的评分（0分表示严重问题，5分表示完美状态）。"
-            },
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "请分析这张面部照片，识别面部特征（如皮肤状况、皱纹、色斑、面部对称性等），并提供结构化的分析结果。请使用0-5分的评分系统对各个面部区域和问题进行评估。"},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{base64_image}"
-                        }
-                    }
-                ]
-            }
-        ],
-        "max_tokens": 1500
-    }
-    
-    response = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload)
-    result = response.json()
-    
-    # 提取分析结果
-    if "choices" in result and len(result["choices"]) > 0:
-        analysis = result["choices"][0]["message"]["content"]
-        return analysis
-    else:
-        return "分析失败，请检查API密钥或网络连接。"
+}
 
-def analyze_with_deepseek(uploaded_file):
-    """使用DeepSeek VL2进行面部特征分析"""
-    if uploaded_file is None:
-        print("错误：未上传文件")
-        return None
-        
+def get_text(key, lang="zh"):
+    return TRANSLATIONS[lang][key]
+
+# 工具函數
+def encode_image_to_base64(image_file: io.BytesIO) -> str:
+    return base64.b64encode(image_file.getvalue()).decode('utf-8')
+
+@st.cache_data(ttl=3600)
+def analyze_image(image_file: io.BytesIO) -> dict:
     try:
-        # 创建临时文件
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as temp_file:
-            temp_image_path = temp_file.name
-            temp_file.write(uploaded_file.read())
-            temp_file.flush()
-        
-        # 将图像转换为base64
-        with open(temp_image_path, "rb") as image_file:
-            base64_image = base64.b64encode(image_file.read()).decode('utf-8')
-        
-        # 调用 DeepSeek API 进行分析
-        headers = {
-            "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        
-        payload = {
-            "model": "deepseek-vl",
-            "messages": [
+        logger.info("調用 Grok-2-Vision-1212 進行圖片分析")
+        base64_image = encode_image_to_base64(image_file)
+        response = xai_client.chat.completions.create(
+            model="grok-2-vision-1212",
+            messages=[
                 {
                     "role": "system",
-                    "content": "你是一位专业的医美顾问。请分析上传的面部照片，识别面部特征并提供详细的医美建议。请按照以下区域进行分析：额头、眼周、鼻子、颧骨、嘴唇、下巴。对每个区域的皮肤状况、皱纹、色斑、紧致度等进行0-5分的评分（0分表示严重问题，5分表示完美状态）。"
+                    "content": "你是專業醫美顧問，請對此面部照片進行詳細分析，提供結構化報告。"
                 },
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": "请分析这张面部照片，识别面部特征（如皮肤状况、皱纹、色斑、面部对称性等），并提供结构化的分析结果。请使用0-5分的评分系统对各个面部区域和问题进行评估。"},
+                        {
+                            "type": "text",
+                            "text": """
+                                請對此面部照片進行詳細分析，提供結構化報告。針對以下區域：額頭、眼周、鼻子、頰骨、嘴唇、下巴，評估：
+                                1. 皮膚狀況（乾燥、油性、痤瘡等）
+                                2. 皺紋（深度、分布）
+                                3. 色斑（類型、範圍）
+                                4. 緊致度（鬆弛程度）
+                                5. 其他特徵（毛孔、黑眼圈等）
+                                對每個維度給出 0-5 分評分（0 表示嚴重問題，5 表示完美），並附上簡短描述。
+                                輸出格式：
+                                - 額頭: 皮膚狀況 X/5（描述）, 皺紋 X/5（描述）, ...
+                                - 眼周: ...
+                                - ...
+                            """
+                        },
                         {
                             "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{base64_image}"
-                            }
+                            "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
                         }
                     ]
                 }
             ],
-            "temperature": 0.3,
-            "max_tokens": 1500
-        }
-        
-        try:
-            response = requests.post(
-                "https://api.deepseek.com/v1/chat/completions",
-                headers=headers,
-                json=payload,
-                timeout=30
-            )
-            result = response.json()
-            
-            # 提取分析结果
-            if "choices" in result and len(result["choices"]) > 0:
-                analysis = result["choices"][0]["message"]["content"]
-            else:
-                # 如果API调用失败，返回模拟结果
-                analysis = "面部分析结果：皮肤状况良好，额头有轻微皱纹，眼周有黑眼圈，鼻子区域毛孔略大，颧骨区域有轻微色斑，嘴唇干燥，下巴轮廓清晰。"
-                print("API调用失败，返回模拟结果")
-        except Exception as api_error:
-            # 如果API调用出错，返回模拟结果
-            analysis = "面部分析结果：皮肤状况良好，额头有轻微皱纹，眼周有黑眼圈，鼻子区域毛孔略大，颧骨区域有轻微色斑，嘴唇干燥，下巴轮廓清晰。"
-            print(f"API调用出错: {api_error}，返回模拟结果")
-        
-        # 确保在使用完临时文件后安全删除
-        try:
-            time.sleep(0.5)  # 给系统一些时间释放文件
-            os.unlink(temp_image_path)
-        except Exception as e:
-            print(f"删除临时文件时发生错误: {e}")
-            
-        # 返回分析结果
-        return analysis
-            
-    except Exception as e:
-        print(f"处理过程中发生错误: {e}")
-        return None  # 出错时返回 None
-
-def generate_report_with_deepseek_r1(analysis_text):
-    """使用DeepSeek-R1生成医美建议报告"""
-    headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    
-    prompt = f"""
-    作为资深医美专家，请根据以下面部分析结果生成专业的医美建议报告：
-    
-    {analysis_text}
-    
-    请在报告中包含以下内容：
-    1. 面部状况综合评估（按区域划分：额头、眼周、鼻子、颧骨、嘴唇、下巴）
-    2. 推荐的医美治疗方案（按优先级排序，至少5种方案）
-    3. 每种方案的预期效果和适用区域
-    4. 术后护理建议
-    5. 风险提示
-    
-    请使用专业但易于理解的语言，并确保建议符合医学伦理。
-    """
-    
-    try:
-        payload = {
-            "model": "deepseek-r1",
-            "messages": [
-                {"role": "system", "content": "你是一位专业的医美顾问，负责生成详细的医美建议报告。"},
-                {"role": "user", "content": prompt}
-            ],
-            "temperature": 0.3,
-            "max_tokens": 2000
-        }
-        
-        response = requests.post(
-            "https://api.deepseek.com/v1/chat/completions",
-            headers=headers,
-            json=payload
+            temperature=0.3,
+            max_tokens=1500
         )
-        result = response.json()
-        
-        # 提取生成的报告
-        if "choices" in result and len(result["choices"]) > 0:
-            report = result["choices"][0]["message"]["content"]
-            
-            # 添加免责声明
-            disclaimer = """
-            **免责声明**：本报告由AI系统生成，仅供参考。在进行任何医美治疗前，请务必咨询专业医生的意见。
-            """
-            
-            full_report = report + "\n\n" + disclaimer
-            return full_report
-        else:
-            return "报告生成失败，请检查API密钥或网络连接。"
+        result = response.choices[0].message.content
+        logger.info(f"Grok-2-Vision-1212 分析結果: {result}")
+        return {
+            "status": "success",
+            "data": result,
+            "error": None
+        }
     except Exception as e:
-        return f"报告生成失败: {str(e)}"
+        logger.error(f"Grok-2-Vision-1212 圖片分析失敗: {str(e)}", exc_info=True)
+        return {
+            "status": "error",
+            "data": None,
+            "error": str(e)
+        }
 
-def create_face_heatmap(image, analysis_result):
-    """创建面部问题热力图"""
-    # 添加空值检查
-    if analysis_result is None:
-        print("警告：分析结果为空")
-        return None
-    
-    # 确保 analysis_result 是字符串类型
-    if not isinstance(analysis_result, str):
-        print(f"警告：分析结果类型不正确，预期字符串类型，实际为 {type(analysis_result)}")
-        # 尝试转换为字符串
-        try:
-            analysis_result = str(analysis_result)
-        except:
-            return None
-    
-    # 创建临时目录
-    os.makedirs("temp", exist_ok=True)
-    
-    # 转换图像为numpy数组
-    img_array = np.array(image)
-    
-    # 创建热力图遮罩 (模拟数据，实际应用中需根据分析结果生成)
-    mask = np.zeros_like(img_array[:,:,0]).astype(float)
-    
-    # 假设分析结果包含问题区域，这里简单模拟几个问题区域
-    # 在实际应用中，这些区域应该来自AI分析结果
-    h, w = mask.shape
-    
-    # 模拟几个问题区域 (基于文本分析)
-    # 额头区域
-    if "皱纹" in analysis_result or "额头" in analysis_result:
-        severity = 0.7
-        if "严重" in analysis_result or "深度" in analysis_result:
-            severity = 0.9
-        mask[int(h*0.1):int(h*0.3), int(w*0.3):int(w*0.7)] = severity
-    
-    # 眼周区域
-    if "眼袋" in analysis_result or "黑眼圈" in analysis_result or "眼周" in analysis_result:
-        severity = 0.7
-        if "严重" in analysis_result or "明显" in analysis_result:
-            severity = 0.9
-        mask[int(h*0.3):int(h*0.4), int(w*0.25):int(w*0.45)] = severity
-        mask[int(h*0.3):int(h*0.4), int(w*0.55):int(w*0.75)] = severity
-    
-    # 颧骨区域
-    if "色斑" in analysis_result or "色素沉着" in analysis_result or "颧骨" in analysis_result:
-        severity = 0.6
-        if "严重" in analysis_result or "明显" in analysis_result:
-            severity = 0.8
-        mask[int(h*0.4):int(h*0.5), int(w*0.15):int(w*0.35)] = severity
-        mask[int(h*0.4):int(h*0.5), int(w*0.65):int(w*0.85)] = severity
-    
-    # 鼻子区域
-    if "毛孔" in analysis_result or "油性" in analysis_result or "鼻子" in analysis_result:
-        severity = 0.6
-        if "严重" in analysis_result or "明显" in analysis_result:
-            severity = 0.8
-        mask[int(h*0.35):int(h*0.5), int(w*0.45):int(w*0.55)] = severity
-    
-    # 嘴唇区域
-    if "唇纹" in analysis_result or "嘴唇" in analysis_result:
-        severity = 0.5
-        if "严重" in analysis_result or "明显" in analysis_result:
-            severity = 0.7
-        mask[int(h*0.55):int(h*0.65), int(w*0.4):int(w*0.6)] = severity
-    
-    # 下巴区域
-    if "松弛" in analysis_result or "下垂" in analysis_result or "下巴" in analysis_result:
-        severity = 0.5
-        if "严重" in analysis_result or "明显" in analysis_result:
-            severity = 0.7
-        mask[int(h*0.65):int(h*0.75), int(w*0.4):int(w*0.6)] = severity
-    
-    # 平滑热力图
-    mask = cv2.GaussianBlur(mask, (51, 51), 0)
-    
-    # 创建自定义色图 (从透明到红色)
-    colors = [(0, 0, 0, 0), (1, 0, 0, 0.7)]
-    cmap = LinearSegmentedColormap.from_list("custom_cmap", colors)
-    
-    # 创建图像
-    fig, ax = plt.subplots(figsize=(10, 8))
-    ax.imshow(img_array)
-    ax.imshow(mask, cmap=cmap)
-    ax.axis('off')
-    
-    # 保存图像
-    plt.tight_layout()
-    heatmap_path = "temp/face_heatmap.png"
-    plt.savefig(heatmap_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    return heatmap_path
-
-def create_radar_chart(analysis_result):
-    """创建面部评分雷达图"""
-    # 创建临时目录
-    os.makedirs("temp", exist_ok=True)
-    
-    # 评估类别
-    categories = ['肤质', '皱纹', '色斑', '紧致度', '毛孔', '肤色均匀度']
-    
-    # 模拟评分 (这里使用简单的文本分析来模拟评分)
-    scores = []
-    scores.append(5 - (0.5 if "干燥" in analysis_result else 0) - (1 if "油性" in analysis_result else 0) - (1.5 if "敏感" in analysis_result else 0))
-    scores.append(5 - (1 if "皱纹" in analysis_result else 0) - (1 if "细纹" in analysis_result else 0) - (1.5 if "深度皱纹" in analysis_result else 0))
-    scores.append(5 - (1 if "色斑" in analysis_result else 0) - (1 if "黑斑" in analysis_result else 0) - (1.5 if "色素沉着" in analysis_result else 0))
-    scores.append(5 - (1 if "松弛" in analysis_result else 0) - (1 if "下垂" in analysis_result else 0) - (1.5 if "轮廓不清" in analysis_result else 0))
-    scores.append(5 - (1 if "毛孔" in analysis_result else 0) - (1 if "毛孔粗大" in analysis_result else 0) - (1.5 if "毛孔扩张" in analysis_result else 0))
-    scores.append(5 - (1 if "不均匀" in analysis_result else 0) - (1 if "暗沉" in analysis_result else 0) - (1.5 if "泛红" in analysis_result else 0))
-    
-    # 确保所有评分在0-5之间
-    scores = [max(0, min(5, score)) for score in scores]
-    
-    # 创建雷达图
-    fig = plt.figure(figsize=(8, 8))
-    ax = fig.add_subplot(111, polar=True)
-    
-    # 角度设置
-    angles = np.linspace(0, 2*np.pi, len(categories), endpoint=False).tolist()
-    scores_closed = scores.copy()
-    scores_closed.append(scores[0])  # 闭合雷达图
-    angles_closed = angles.copy()
-    angles_closed.append(angles[0])  # 闭合雷达图
-    
-    # 绘制雷达图
-    ax.plot(angles_closed, scores_closed, 'o-', linewidth=2, color='#FF5757')
-    ax.fill(angles_closed, scores_closed, alpha=0.25, color='#FF5757')
-    
-    # 设置刻度和标签
-    ax.set_thetagrids(np.degrees(angles), categories)
-    ax.set_ylim(0, 5)
-    ax.set_yticks([1, 2, 3, 4, 5])
-    ax.set_yticklabels(['1', '2', '3', '4', '5'])
-    ax.grid(True)
-    
-    # 添加标题
-    plt.title('面部状况评分', size=15, y=1.1)
-    
-    # 保存图像
-    plt.tight_layout()
-    radar_path = "temp/radar_chart.png"
-    plt.savefig(radar_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    return radar_path
-
-def create_treatment_priority_chart(report):
-    """创建治疗方案优先级条形图"""
-    # 创建临时目录
-    os.makedirs("temp", exist_ok=True)
-    
-    # 从报告中提取治疗方案 (这里使用简单的文本分析，实际应用中可能需要更复杂的解析)
-    treatments = []
-    priorities = []
-    
-    # 简单解析报告中的治疗方案
-    lines = report.split('\n')
-    in_treatment_section = False
-    
-    for line in lines:
-        if "推荐的医美治疗方案" in line or "推荐治疗方案" in line:
-            in_treatment_section = True
-            continue
-        
-        if in_treatment_section and ("术后护理" in line or "预期效果" in line or "风险提示" in line):
-            in_treatment_section = False
-            break
-            
-        if in_treatment_section and line.strip() and any(char.isdigit() for char in line[:5]):
-            # 假设方案按优先级编号，如"1. 玻尿酸填充"
-            try:
-                # 提取优先级数字
-                priority = int(''.join(filter(str.isdigit, line.split('.')[0])))
-                
-                # 提取治疗名称 (简单处理)
-                treatment_name = line.split('.')[1].split('：')[0].strip() if '：' in line.split('.')[1] else line.split('.')[1].strip()
-                
-                treatments.append(treatment_name)
-                priorities.append(6 - priority)  # 转换为评分 (5最高，1最低)
-            except:
-                continue
-    
-    # 如果没有提取到治疗方案，使用示例数据
-    if not treatments:
-        treatments = ["玻尿酸填充", "肉毒素注射", "激光焕肤", "水光针", "线雕提升"]
-        priorities = [5, 4, 3, 2, 1]
-    
-    # 创建条形图
-    fig, ax = plt.subplots(figsize=(10, 6))
-    
-    # 根据优先级对治疗方案进行排序
-    sorted_indices = np.argsort(priorities)[::-1]  # 降序排列
-    sorted_treatments = [treatments[i] for i in sorted_indices]
-    sorted_priorities = [priorities[i] for i in sorted_indices]
-    
-    # 绘制条形图
-    bars = ax.barh(sorted_treatments, sorted_priorities, color='#5DA5DA')
-    
-    # 添加数值标签
-    for i, v in enumerate(sorted_priorities):
-        ax.text(v + 0.1, i, str(v), va='center')
-    
-    # 设置轴标签
-    ax.set_xlabel('优先级评分')
-    ax.set_ylabel('治疗方案')
-    
-    # 添加标题
-    ax.set_title('推荐治疗方案优先级')
-    
-    # 保存图像
-    plt.tight_layout()
-    priority_path = "temp/treatment_priority.png"
-    plt.savefig(priority_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    return priority_path
-
-def format_medical_beauty_report(report, analysis_result, heatmap_path, radar_path, priority_path, model_choice):
-    """格式化为医美诊所专用报告模板"""
-    
-    # 提取患者基本信息（示例）
-    assessment_date = datetime.datetime.now().strftime('%Y-%m-%d')
-    
-    # 处理可能为None的路径
-    heatmap_html = ""
-    if heatmap_path:
-        try:
-            heatmap_html = f'<img src="data:image/png;base64,{base64.b64encode(open(heatmap_path, "rb").read()).decode()}" alt="面部问题热力图">'
-        except:
-            heatmap_html = "<p>热力图生成失败</p>"
-    else:
-        heatmap_html = "<p>热力图不可用</p>"
-        
-    radar_html = ""
-    if radar_path:
-        try:
-            radar_html = f'<img src="data:image/png;base64,{base64.b64encode(open(radar_path, "rb").read()).decode()}" alt="面部状况评分">'
-        except:
-            radar_html = "<p>雷达图生成失败</p>"
-    else:
-        radar_html = "<p>雷达图不可用</p>"
-        
-    priority_html = ""
-    if priority_path:
-        try:
-            priority_html = f'<img src="data:image/png;base64,{base64.b64encode(open(priority_path, "rb").read()).decode()}" alt="治疗方案优先级">'
-        except:
-            priority_html = "<p>优先级图生成失败</p>"
-    else:
-        priority_html = "<p>优先级图不可用</p>"
-    
-    # 创建HTML报告
-    html_report = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="UTF-8">
-        <title>医美评估报告</title>
-        <style>
-            body {{
-                font-family: 'Arial', sans-serif;
-                margin: 0;
-                padding: 0;
-                color: #333;
-                background-color: #f9f9f9;
-            }}
-            .report-container {{
-                max-width: 1000px;
-                margin: 0 auto;
-                padding: 20px;
-                background-color: white;
-                box-shadow: 0 0 10px rgba(0,0,0,0.1);
-            }}
-            .header {{
-                text-align: center;
-                padding: 20px 0;
-                border-bottom: 2px solid #ddd;
-                margin-bottom: 20px;
-            }}
-            .logo {{
-                max-width: 150px;
-                margin-bottom: 10px;
-            }}
-            h1 {{
-                color: #2c3e50;
-                margin: 0;
-            }}
-            h2 {{
-                color: #3498db;
-                border-bottom: 1px solid #eee;
-                padding-bottom: 10px;
-                margin-top: 30px;
-            }}
-            .patient-info {{
-                display: flex;
-                justify-content: space-between;
-                margin: 20px 0;
-                padding: 15px;
-                background-color: #f8f9fa;
-                border-radius: 5px;
-            }}
-            .info-item {{
-                margin-bottom: 10px;
-            }}
-            .info-label {{
-                font-weight: bold;
-                margin-right: 10px;
-            }}
-            .visualizations {{
-                display: flex;
-                flex-wrap: wrap;
-                justify-content: space-between;
-                margin: 20px 0;
-            }}
-            .vis-item {{
-                width: 48%;
-                margin-bottom: 20px;
-            }}
-            .vis-item img {{
-                width: 100%;
-                border: 1px solid #ddd;
-                border-radius: 5px;
-            }}
-            .vis-caption {{
-                text-align: center;
-                margin-top: 5px;
-                font-style: italic;
-                color: #666;
-            }}
-            .assessment {{
-                margin: 20px 0;
-            }}
-            .treatment-plan {{
-                margin: 20px 0;
-            }}
-            .treatment-item {{
-                margin-bottom: 15px;
-                padding-left: 20px;
-                border-left: 3px solid #3498db;
-            }}
-            .disclaimer {{
-                margin-top: 30px;
-                padding: 15px;
-                background-color: #f8f9fa;
-                border-radius: 5px;
-                font-size: 0.9em;
-                color: #666;
-            }}
-            .footer {{
-                text-align: center;
-                margin-top: 40px;
-                padding-top: 20px;
-                border-top: 1px solid #eee;
-                font-size: 0.9em;
-                color: #666;
-            }}
-        </style>
-    </head>
-    <body>
-        <div class="report-container">
-            <div class="header">
-                <h1>AI医美智能评估报告</h1>
-                <p>生成日期: {assessment_date}</p>
-            </div>
-            
-            <div class="patient-info">
-                <div class="info-column">
-                    <div class="info-item">
-                        <span class="info-label">评估日期:</span>
-                        <span>{assessment_date}</span>
-                    </div>
-                    <div class="info-item">
-                        <span class="info-label">评估模型:</span>
-                        <span>{model_choice}</span>
-                    </div>
-                </div>
-                <div class="info-column">
-                    <div class="info-item">
-                        <span class="info-label">报告编号:</span>
-                        <span>AI-{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}</span>
-                    </div>
-                </div>
-            </div>
-            
-            <h2>面部分析可视化</h2>
-            
-            <div class="visualizations">
-                <div class="vis-item">
-                    {heatmap_html}
-                    <div class="vis-caption">面部问题热力图</div>
-                </div>
-                <div class="vis-item">
-                    {radar_html}
-                    <div class="vis-caption">面部状况评分</div>
-                </div>
-                <div class="vis-item">
-                    {priority_html}
-                    <div class="vis-caption">治疗方案优先级</div>
-                </div>
-            </div>
-            
-            <h2>面部评估结果</h2>
-            
-            <div class="assessment">
-                {report}
-            </div>
-            
-            <div class="disclaimer">
-                <strong>免责声明:</strong> 本报告由AI系统生成，仅供参考。在进行任何医美治疗前，请务必咨询专业医生的意见。分析结果和治疗建议基于AI模型的图像识别和数据分析，不构成医疗诊断或处方。
-            </div>
-            
-            <div class="footer">
-                © {datetime.datetime.now().year} AI医美智能评估系统 | 本系统仅供专业医美机构使用
-            </div>
-        </div>
-    </body>
-    </html>
-    """
-    
-    return html_report
-
-def generate_pdf_report(report_text, analysis_result, heatmap_path, radar_path, priority_path):
-    """生成PDF格式的医美分析报告"""
-    # 创建临时PDF文件
-    temp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
-    pdf_path = temp_pdf.name
-    
-    # 创建PDF文档
-    c = canvas.Canvas(pdf_path, pagesize=A4)
-    width, height = A4
-    
-    # 设置中文字体
+@st.cache_data(ttl=3600)
+def generate_report(analysis_result: str) -> str:
     try:
-        # 尝试使用系统中文字体
-        font_path = fm.findfont(fm.FontProperties(family=['SimHei', 'Microsoft YaHei', 'SimSun']))
-        pdfmetrics.registerFont(TTFont('SimHei', font_path))
-        default_font = 'SimHei'
-    except:
-        print("警告：无法加载中文字体，将使用默认字体")
-        default_font = 'Helvetica'
-    
-    def draw_text_with_wrap(text, x, y, width, font_name, font_size):
-        """绘制自动换行的文本"""
-        c.setFont(font_name, font_size)
-        words = text.split()
-        lines = []
-        current_line = []
-        
-        # 处理中文文本
-        if any('\u4e00' <= char <= '\u9fff' for char in text):
-            # 中文文本按字符分割
-            words = list(text)
-            max_chars_per_line = int(width / (font_size * 0.7))  # 估算每行可容纳的中文字符数
-            
-            for i in range(0, len(words), max_chars_per_line):
-                lines.append(''.join(words[i:i + max_chars_per_line]))
-        else:
-            # 英文文本按单词分割
-            for word in words:
-                test_line = ' '.join(current_line + [word])
-                if c.stringWidth(test_line, font_name, font_size) < width:
-                    current_line.append(word)
-                else:
-                    if current_line:
-                        lines.append(' '.join(current_line))
-                        current_line = [word]
-                    else:
-                        lines.append(word)
-            if current_line:
-                lines.append(' '.join(current_line))
-        
-        # 绘制文本
-        for line in lines:
-            if y < 50:  # 如果页面空间不足，添加新页面
-                c.showPage()
-                c.setFont(font_name, font_size)
-                y = height - 50
-            c.drawString(x, y, line)
-            y -= font_size * 1.5
-        
-        return y
-    
-    # 绘制标题
-    y = height - 50
-    c.setFont(default_font, 24)
-    c.drawString(50, y, "AI医美智能评估报告")
-    
-    # 添加生成时间
-    y -= 40
-    c.setFont(default_font, 12)
-    current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    c.drawString(50, y, f"生成时间：{current_time}")
-    
-    # 添加分析结果
-    y -= 40
-    c.setFont(default_font, 14)
-    c.drawString(50, y, "面部分析结果：")
-    y -= 30
-    
-    # 使用自动换行函数绘制报告文本
-    y = draw_text_with_wrap(report_text, 50, y, width - 100, default_font, 12)
-    
-    # 添加图表（每个图表单独一页）
-    def add_image_page(image_path, title):
-        if os.path.exists(image_path):
-            c.showPage()
-            c.setFont(default_font, 14)
-            c.drawString(50, height - 50, title)
-            try:
-                c.drawImage(image_path, 50, height - 400, width=400, height=300)
-            except Exception as e:
-                print(f"添加图片时发生错误: {e}")
-    
-    add_image_page(heatmap_path, "面部问题热力图")
-    add_image_page(radar_path, "面部状况评分")
-    add_image_page(priority_path, "治疗方案优先级")
-    
-    # 添加免责声明（新页面）
-    c.showPage()
-    c.setFont(default_font, 14)
-    c.drawString(50, height - 50, "免责声明")
-    
-    disclaimer = """
-    1. 本报告由AI系统生成，仅供参考。
-    2. 在进行任何医美治疗前，请务必咨询专业医生的意见。
-    3. 本报告不构成医疗建议或诊断。
-    4. 所有治疗方案都应在专业医生的指导下进行。
-    """
-    y = height - 80
-    for line in disclaimer.split('\n'):
-        line = line.strip()
-        if line:
-            y = draw_text_with_wrap(line, 50, y, width - 100, default_font, 12)
-            y -= 10
-    
-    # 保存PDF
-    try:
-        c.save()
+        logger.info("調用 DeepSeek R1 生成報告")
+        response = deepseek_client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system", "content": """
+                    你是資深醫美專家，請根據以下面部分析結果生成一份專業、詳盡的醫美建議報告，字數至少 500 字。報告應包含以下內容，並確保語言邏輯清晰、結構分明，符合醫美行業標準：
+                    1. 面部狀況綜合評估：
+                       - 針對額頭、眼周、鼻子、頰骨、嘴唇、下巴，總結各區域的皮膚狀況、皺紋、色斑、緊致度等。
+                       - 分析整體面部健康狀態，提供專業診斷，結合數據進行深入推理。
+                    2. 推薦的醫美治療方案：
+                       - 提供至少 5 種具體治療方案，按優先級排序。
+                       - 每項包括治療名稱、適用區域、實施方式（如注射劑量、療程次數）。
+                    3. 預期效果：
+                       - 詳細描述每種方案的預期效果（如皺紋減少百分比、緊致度提升程度），使用量化數據並進行邏輯推導。
+                    4. 術後護理建議：
+                       - 針對每種方案提供具體護理措施（如保濕、防曬頻率、飲食建議），考慮長期效果。
+                    5. 風險提示：
+                       - 列出每種方案的潛在風險（如紅腫、過敏）及緩解方法，分析風險可能性。
+                    使用專業術語（如「皮下注射」、「色素分解」、「組織提拉」），確保報告詳實且具權威性，展示深入的醫學推理能力。
+                """},
+                {"role": "user", "content": f"""
+                    請根據以下面部分析結果生成報告：
+                    {analysis_result}
+                """}
+            ],
+            temperature=0.3,
+            max_tokens=2000,
+            stream=False
+        )
+        report = response.choices[0].message.content
+        logger.info(f"DeepSeek R1 報告結果: {report}, 字數: {len(report)}")
+        if len(report) < 500:
+            logger.warning("報告字數不足 500 字")
+            raise ValueError("報告字數不足")
+        return report + "\n\n**免責聲明**：本報告由 DeepSeek R1 AI 生成，僅供參考，具體治療需諮詢專業醫生。"
     except Exception as e:
-        print(f"保存PDF时发生错误: {e}")
-        return None
-    
-    return pdf_path
+        logger.error(f"DeepSeek R1 報告生成失敗: {str(e)}")
+        return f"錯誤: DeepSeek R1 報告生成失敗 ({str(e)})"
 
-# 文件上传
-uploaded_file = st.file_uploader("上传面部照片", type=["jpg", "jpeg", "png"])
+@st.cache_data
+def create_visualizations(_image: PILImage.Image, analysis_result: str, report: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """创建可视化图表"""
+    temp_dir = "temp"
+    os.makedirs(temp_dir, exist_ok=True)
+    heatmap_path = os.path.join(temp_dir, "face_heatmap.png")
+    radar_path = os.path.join(temp_dir, "radar_chart.png")
+    priority_path = os.path.join(temp_dir, "treatment_priority.png")
 
-if uploaded_file is not None:
-    # 显示上传的图片
-    image = Image.open(uploaded_file)
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.image(image, caption="上传的照片", use_column_width=True)
-    
-    # 分析按钮
-    if st.button("开始分析"):
-        with st.spinner("正在分析面部特征..."):
-            # 根据选择的模型进行分析
-            if model_choice == "GPT-4o":
-                analysis_result = analyze_with_gpt4o(uploaded_file)
+    # 热力图
+    try:
+        img_array = np.array(_image)
+        mask = np.zeros_like(img_array[:, :, 0], dtype=float)
+        h, w = mask.shape
+        regions = detect_face_regions(_image)
+        
+        for region, (y1, y2, x1, x2) in regions.items():
+            # 确保坐标在图像范围内
+            y1, y2 = max(0, y1), min(h, y2)
+            x1, x2 = max(0, x1), min(w, x2)
+            
+            # 查找评分
+            score_match = re.search(rf"{region}.*?皮膚狀況\s*(\d)/5", analysis_result)
+            if score_match:
+                score = int(score_match.group(1))
+                severity = (5 - score) / 5
+                mask[y1:y2, x1:x2] = severity
             else:
-                analysis_result = analyze_with_deepseek(uploaded_file)
-            
-            # 显示分析结果
-            with col2:
-                st.subheader("分析结果")
-                st.write(analysis_result)
-            
-            # 在调用 create_face_heatmap 之前添加调试信息
-            print("分析结果:", analysis_result)
-            print("分析结果类型:", type(analysis_result))
-            
-            # 生成报告
-            with st.spinner("正在生成医美建议报告..."):
-                if analysis_result:
-                    # 添加调试信息
-                    print("分析结果内容:", analysis_result)
-                    
-                    # 生成报告
-                    report = generate_report_with_deepseek_r1(analysis_result)
-                    
-                    # 添加调试信息
-                    print("生成的报告内容:", report)
-                    
-                    # 如果报告生成失败，使用备用报告模板
-                    if not report or report == "报告生成失败，请检查API密钥或网络连接。":
-                        st.warning("API 调用失败，使用备用报告模板")
-                        report = f"""
-# AI医美分析报告
-
-## 面部状况综合评估
-
-{analysis_result}
-
-## 推荐治疗方案
-
-1. 根据分析结果，建议进行以下治疗：
-   - 基础护理：深层清洁、补水保湿
-   - 进阶护理：根据具体问题定制方案
-
-## 注意事项
-
-1. 请在专业医生指导下进行治疗
-2. 保持良好的护肤习惯
-3. 定期进行皮肤状况评估
-
-## 免责声明
-
-本报告仅供参考，具体治疗方案请咨询专业医生。
-"""
-                    else:
-                        report = "无法生成报告，因为分析结果为空"
-                        st.error("分析失败，无法生成报告")
-            
-            # 创建数据可视化
-            with st.spinner("正在生成数据可视化..."):
-                if analysis_result:
-                    try:
-                        print("开始生成热力图...")
-                        heatmap_path = create_face_heatmap(image, analysis_result)
-                        print("热力图路径:", heatmap_path)
-                        
-                        print("开始生成雷达图...")
-                        radar_path = create_radar_chart(analysis_result)
-                        print("雷达图路径:", radar_path)
-                        
-                        print("开始生成优先级图...")
-                        priority_path = create_treatment_priority_chart(report)
-                        print("优先级图路径:", priority_path)
-                        
-                        # 显示可视化图表
-                        st.subheader("面部分析可视化")
-                        vis_col1, vis_col2 = st.columns(2)
-                        
-                        with vis_col1:
-                            if heatmap_path and os.path.exists(heatmap_path):
-                                st.image(heatmap_path, caption="面部问题热力图", use_container_width=True)
-                            else:
-                                st.warning("无法生成热力图")
-                            
-                            if priority_path and os.path.exists(priority_path):
-                                st.image(priority_path, caption="治疗方案优先级", use_container_width=True)
-                            else:
-                                st.warning("无法生成治疗方案优先级图")
-                        
-                        with vis_col2:
-                            if radar_path and os.path.exists(radar_path):
-                                st.image(radar_path, caption="面部状况评分", use_container_width=True)
-                            else:
-                                st.warning("无法生成雷达图")
-                    except Exception as e:
-                        print(f"生成可视化图表时发生错误: {str(e)}")
-                        st.error("生成可视化图表时发生错误")
-                else:
-                    st.error("分析失败，无法生成可视化图表")
-            
-            # 显示生成的报告
-            if analysis_result and report:
-                st.subheader("医美建议报告")
-                st.markdown(report)
+                # 默认值
+                mask[y1:y2, x1:x2] = 0.5
                 
-                try:
-                    print("开始生成专业报告...")
-                    # 生成专业报告
-                    formatted_report = format_medical_beauty_report(
-                        report, 
-                        analysis_result, 
-                        heatmap_path if 'heatmap_path' in locals() else None, 
-                        radar_path if 'radar_path' in locals() else None, 
-                        priority_path if 'priority_path' in locals() else None,
-                        model_choice
-                    )
-                    print("专业报告生成成功")
-                    
-                    # 保存报告相关数据到 session_state
-                    st.session_state.report_generated = True
-                    st.session_state.report_text = report
-                    st.session_state.analysis_result = analysis_result
-                    st.session_state.heatmap_path = heatmap_path if 'heatmap_path' in locals() else None
-                    st.session_state.radar_path = radar_path if 'radar_path' in locals() else None
-                    st.session_state.priority_path = priority_path if 'priority_path' in locals() else None
-                    
-                    # 提供下载报告功能
-                    b64 = base64.b64encode(formatted_report.encode()).decode()
-                    href = f'<a href="data:text/html;base64,{b64}" download="医美建议报告.html">下载专业医美报告</a>'
-                    st.markdown(href, unsafe_allow_html=True)
-                    
-                    # 生成并显示 PDF 下载按钮
-                    try:
-                        print("开始生成PDF...")
-                        # 处理报告文本，移除特殊格式
-                        processed_report = report.replace("**", "").replace("#", "").strip()
-                        if processed_report:
-                            print("处理后的报告长度:", len(processed_report))
-                            # 生成PDF
-                            pdf_path = generate_pdf_report(
-                                processed_report,
-                                analysis_result,
-                                heatmap_path if 'heatmap_path' in locals() else None,
-                                radar_path if 'radar_path' in locals() else None,
-                                priority_path if 'priority_path' in locals() else None
-                            )
-                            
-                            if pdf_path and os.path.exists(pdf_path):
-                                print("PDF文件生成成功:", pdf_path)
-                                # 读取并提供下载
-                                with open(pdf_path, "rb") as pdf_file:
-                                    pdf_bytes = pdf_file.read()
-                                    if len(pdf_bytes) > 0:
-                                        st.download_button(
-                                            label="下载PDF报告",
-                                            data=pdf_bytes,
-                                            file_name=f"医美分析报告_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
-                                            mime="application/pdf"
-                                        )
-                                        print("PDF下载按钮创建成功")
-                                    else:
-                                        st.error("生成的PDF文件为空")
-                                        print("错误：PDF文件为空")
-                                
-                                # 清理临时文件
-                                try:
-                                    os.unlink(pdf_path)
-                                except Exception as e:
-                                    print(f"清理临时PDF文件时发生错误: {e}")
-                            else:
-                                st.error("PDF文件生成失败")
-                                print("错误：PDF文件生成失败或文件不存在")
-                        else:
-                            st.error("无法生成PDF：处理后的报告内容为空")
-                            print("错误：处理后的报告内容为空")
-                            
-                    except Exception as e:
-                        st.error(f"生成PDF报告时发生错误: {str(e)}")
-                        print(f"PDF生成错误详情: {str(e)}")
-                        
-                except Exception as e:
-                    st.error(f"生成专业报告时发生错误: {str(e)}")
-                    print(f"专业报告生成错误详情: {str(e)}")
+        # 应用高斯模糊使热力图更平滑
+        mask = cv2.GaussianBlur(mask, (51, 51), 0)
+        
+        plt.figure(figsize=(8, 6))
+        plt.imshow(img_array)
+        plt.imshow(mask, cmap='RdYlGn_r', alpha=0.5)
+        plt.axis('off')
+        plt.tight_layout()
+        plt.savefig(heatmap_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info(f"熱力圖生成成功: {heatmap_path}")
+    except Exception as e:
+        logger.error(f"熱力圖生成失敗: {str(e)}", exc_info=True)
+        heatmap_path = None
 
-# 页脚
-st.markdown("---")
-st.markdown("© 2023 AI医美智能评估系统 | 本系统仅供参考，请遵医嘱") 
+    # 雷達圖
+    try:
+        categories = ['膚質', '皺紋', '色斑', '緊致度', '毛孔', '膚色均勻度']
+        current_scores = []
+        ideal_scores = [5] * len(categories)
+        for category in categories:
+            match = re.search(rf"{category}.*?(\d)/5", analysis_result, re.IGNORECASE)
+            score = int(match.group(1)) if match else 4
+            current_scores.append(score)
+        angles = np.linspace(0, 2 * np.pi, len(categories), endpoint=False).tolist()
+        current_scores += current_scores[:1]
+        ideal_scores += ideal_scores[:1]
+        angles += angles[:1]
+        fig, ax = plt.subplots(figsize=(6, 6), subplot_kw=dict(polar=True))
+        ax.fill(angles, current_scores, color='#4A90E2', alpha=0.5, label='當前狀況')
+        ax.fill(angles, ideal_scores, color='#D3E4F5', alpha=0.2, label='理想狀態')
+        ax.set_yticks([1, 2, 3, 4, 5])
+        ax.set_xticks(angles[:-1])
+        ax.set_xticklabels(categories)
+        ax.legend(loc='upper right', bbox_to_anchor=(1.1, 1.1))
+        plt.savefig(radar_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info(f"雷達圖生成成功: {radar_path}")
+    except Exception as e:
+        logger.error(f"雷達圖生成失敗: {str(e)}")
+        radar_path = None
+
+    # 優先級圖
+    try:
+        treatments = []
+        priorities = []
+        for line in report.split('\n'):
+            match = re.search(r'(\d+)\)\s*([^0-5].*?)(?=\s*\d|\n|$)', line)
+            if match:
+                priority = int(match.group(1))
+                treatment = match.group(2).strip()
+                treatments.append(treatment)
+                priorities.append(6 - priority)
+        if not treatments:
+            treatments = ["玻尿酸填充", "肉毒素注射", "激光治療"]
+            priorities = [5, 4, 3]
+        fig = px.bar(
+            x=priorities, y=treatments, orientation='h',
+            labels={'x': '優先級', 'y': '治療方案'},
+            title="治療方案優先級",
+            color=priorities, color_continuous_scale='Blues',
+            text=priorities
+        )
+        fig.update_traces(textposition='auto')
+        fig.update_layout(showlegend=False, width=600, height=400)
+        fig.write_image(priority_path, scale=2)
+        logger.info(f"優先級圖生成成功: {priority_path}")
+    except Exception as e:
+        logger.error(f"優先級圖生成失敗: {str(e)}")
+        priority_path = None
+
+    return heatmap_path, radar_path, priority_path
+
+def generate_better_pdf(report_text, images):
+    """生成PDF报告，确保支持中文"""
+    try:
+        # 注册中文字体
+        font_path = os.path.join(os.path.dirname(__file__), 'fonts')
+        os.makedirs(font_path, exist_ok=True)
+        
+        # 下载中文字体
+        font_file = os.path.join(font_path, 'simsun.ttf')
+        
+        # 检查字体文件是否存在
+        if not os.path.exists(font_file):
+            # 使用临时内置字体
+            logger.info("使用内置中文字体")
+            temp_font_path = os.path.join(tempfile.gettempdir(), "simsun.ttf")
+            
+            # 如果您有办法将宋体嵌入应用中，可以尝试以下方式
+            try:
+                from fontTools.ttLib import TTFont as FontToolsTTFont
+                # 创建一个简单的字体
+                font = FontToolsTTFont()
+                font.save(temp_font_path)
+                font_file = temp_font_path
+            except:
+                # 如果无法创建字体，使用reportlab提供的基本字体
+                logger.warning("无法创建中文字体，将使用基本字体")
+        
+        # 注册字体
+        try:
+            pdfmetrics.registerFont(TTFont('SimSun', font_file))
+            logger.info("成功注册中文字体")
+        except Exception as e:
+            logger.error(f"注册字体失败: {str(e)}")
+
+        # 创建一个内存中的PDF，而不是直接写入文件
+        buffer = BytesIO()
+        
+        # 创建PDF文档
+        doc = SimpleDocTemplate(buffer, pagesize=A4)
+        styles = getSampleStyleSheet()
+        
+        # 自定义样式以使用中文字体
+        for style_name in styles.byName:
+            styles[style_name].fontName = 'SimSun'
+        
+        story = []
+        
+        # 添加标题
+        title_style = styles['Heading1']
+        title_style.alignment = 1  # 居中对齐
+        story.append(Paragraph("醫美智能評估報告", title_style))
+        story.append(Spacer(1, 12))
+        
+        # 添加日期
+        date_style = styles['Normal']
+        date_style.alignment = 1  # 居中对齐
+        current_date = datetime.datetime.now().strftime("%Y年%m月%d日")
+        story.append(Paragraph(f"生成日期：{current_date}", date_style))
+        story.append(Spacer(1, 20))
+        
+        # 处理报告内容
+        normal_style = styles['Normal']
+        normal_style.leading = 14  # 行间距
+        
+        # 确保报告文本不为空
+        if not report_text or len(report_text.strip()) == 0:
+            report_text = "無法生成報告內容，請重試。"
+        
+        # 分段处理报告文本
+        paragraphs = report_text.split('\n\n')
+        for para in paragraphs:
+            if para.strip():
+                # 检查是否为标题行
+                if re.match(r'^[0-9]+\.\s+\w+', para.strip()):
+                    heading_style = styles['Heading2']
+                    story.append(Paragraph(para, heading_style))
+                else:
+                    # 处理普通段落，保留换行
+                    lines = para.split('\n')
+                    for line in lines:
+                        if line.strip():
+                            story.append(Paragraph(line, normal_style))
+                story.append(Spacer(1, 10))
+        
+        # 添加图片 - 先验证图片是否可用
+        valid_images = []
+        for img_path in images:
+            if img_path and os.path.exists(img_path):
+                try:
+                    # 测试是否可以打开图片
+                    PILImage.open(img_path)
+                    valid_images.append(img_path)
+                except Exception as e:
+                    logger.error(f"无法打开图片 {img_path}: {str(e)}")
+            else:
+                logger.warning(f"图片路径不存在: {img_path}")
+        
+        if valid_images:  # 只有当有有效图片时才添加图表标题
+            story.append(Spacer(1, 20))
+            story.append(Paragraph("分析圖表", styles['Heading2']))
+            story.append(Spacer(1, 10))
+            
+            # 图片处理
+            captions = ["面部問題熱力圖", "面部狀況評分", "治療方案優先級"]
+            for i, img_path in enumerate(valid_images):
+                try:
+                    # 添加图片标题
+                    if i < len(captions):
+                        story.append(Paragraph(captions[i], styles['Heading3']))
+                    
+                    # 打开并处理图片
+                    img = PILImage.open(img_path)
+                    img_width, img_height = img.size
+                    
+                    # 计算适合A4页面的图片尺寸
+                    max_width = 450
+                    aspect = img_height / img_width
+                    new_width = min(max_width, img_width)
+                    new_height = new_width * aspect
+                    
+                    # 添加图片到PDF
+                    img = ReportLabImage(img_path, width=new_width, height=new_height)
+                    story.append(img)
+                    story.append(Spacer(1, 15))
+                except Exception as e:
+                    logger.error(f"处理图片失败: {str(e)}", exc_info=True)
+        
+        # 添加免责声明
+        story.append(Spacer(1, 30))
+        disclaimer_style = styles['Italic']
+        disclaimer_style.textColor = colors.gray
+        story.append(Paragraph("免責聲明：本報告由AI系統生成，僅供參考，具體治療方案請諮詢專業醫生。", disclaimer_style))
+        
+        # 构建PDF
+        try:
+            doc.build(story)
+            buffer.seek(0)
+            
+            # 保存到临时文件
+            temp_pdf = os.path.join(tempfile.gettempdir(), "medical_report.pdf")
+            with open(temp_pdf, 'wb') as f:
+                f.write(buffer.getvalue())
+            
+            logger.info(f"PDF生成成功: {temp_pdf}")
+            return temp_pdf
+        except Exception as e:
+            logger.error(f"构建PDF失败: {str(e)}", exc_info=True)
+            return None
+    except Exception as e:
+        logger.error(f"PDF生成失败: {str(e)}", exc_info=True)
+        return None
+
+def generate_simple_pdf(report_text, images):
+    """使用更简单的方法生成PDF，确保支持中文"""
+    try:
+        # 创建PDF对象
+        pdf = FPDF()
+        pdf.add_page()
+        
+        # 使用Arial Unicode MS字体，这是一个通用的Unicode字体
+        # 注意：FPDF默认不支持中文，我们需要使用特殊方法
+        
+        # 添加标题（使用英文避免字体问题）
+        pdf.set_font('Arial', 'B', 16)
+        pdf.cell(0, 10, 'Medical Beauty Assessment Report', 0, 1, 'C')
+        
+        # 添加日期
+        pdf.set_font('Arial', '', 12)
+        current_date = datetime.datetime.now().strftime("%Y-%m-%d")
+        pdf.cell(0, 10, f'Date: {current_date}', 0, 1, 'C')
+        
+        # 添加中文报告内容的提示
+        pdf.set_font('Arial', '', 10)
+        pdf.multi_cell(0, 5, "Due to font limitations in PDF, Chinese characters cannot be displayed properly.")
+        pdf.multi_cell(0, 5, "Below is the analysis visualization. For full report, please download the text report.")
+        
+        # 添加图片（这部分应该正常工作）
+        valid_images = []
+        for img_path in images:
+            if img_path and os.path.exists(img_path):
+                try:
+                    valid_images.append(img_path)
+                except Exception as e:
+                    logger.error(f"图片验证失败: {str(e)}")
+        
+        # 添加图片
+        for img_path in valid_images:
+            try:
+                pdf.add_page()
+                # 添加图片标题
+                if img_path.endswith("face_heatmap.png"):
+                    pdf.set_font('Arial', 'B', 12)
+                    pdf.cell(0, 10, "Face Problem Heat Map", 0, 1, 'C')
+                elif img_path.endswith("radar_chart.png"):
+                    pdf.set_font('Arial', 'B', 12)
+                    pdf.cell(0, 10, "Facial Condition Score", 0, 1, 'C')
+                elif img_path.endswith("treatment_priority.png"):
+                    pdf.set_font('Arial', 'B', 12)
+                    pdf.cell(0, 10, "Treatment Priority", 0, 1, 'C')
+                
+                # 添加图片，确保适合页面
+                pdf.image(img_path, x=10, y=30, w=190)
+            except Exception as e:
+                logger.error(f"添加图片失败: {str(e)}")
+        
+        # 添加免责声明
+        pdf.set_font('Arial', 'I', 8)
+        pdf.cell(0, 10, 'Disclaimer: This report is generated by AI for reference only.', 0, 1, 'C')
+        
+        # 保存PDF
+        temp_pdf = os.path.join(tempfile.gettempdir(), "medical_report.pdf")
+        pdf.output(temp_pdf)
+        
+        return temp_pdf
+    except Exception as e:
+        logger.error(f"简单PDF生成失败: {str(e)}", exc_info=True)
+        return None
+
+# 主界面
+def main():
+    with st.sidebar:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.header("系統設置")
+        st.write("分析模型：Grok-2-Vision-1212")
+        st.write("報告模型：DeepSeek R1")
+        st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown('<div class="footer">© 2025 醫美診所智能系統</div>', unsafe_allow_html=True)
+
+    # 添加標題容器
+    st.markdown('<div class="title-container">', unsafe_allow_html=True)
+    st.title("醫美診所智能評估系統")
+    st.markdown('</div>', unsafe_allow_html=True)
+    
+    # 添加步驟指示器
+    if "current_step" not in st.session_state:
+        st.session_state["current_step"] = 1
+    
+    current_step = st.session_state["current_step"]
+    
+    # 根據會話狀態更新當前步驟
+    if "image" in st.session_state and current_step < 2:
+        st.session_state["current_step"] = 1
+    if "analysis_result" in st.session_state and current_step < 3:
+        st.session_state["current_step"] = 3
+    if "report" in st.session_state and current_step < 4:
+        st.session_state["current_step"] = 4
+    
+    current_step = st.session_state["current_step"]
+    
+    st.markdown(f"""
+    <div style="display: flex; justify-content: space-between; margin-bottom: 30px; padding: 0 10px;">
+        <div style="display: flex; flex-direction: column; align-items: center; flex: 1;">
+            <div style="width: 40px; height: 40px; border-radius: 50%; background: {
+                'linear-gradient(135deg, var(--primary-color), var(--secondary-color))' if current_step >= 1 else 'var(--neutral-light)'
+            }; display: flex; justify-content: center; align-items: center; color: white; font-weight: bold; margin-bottom: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1);">1</div>
+            <div style="text-align: center; font-size: 14px; color: {
+                'var(--neutral-dark)' if current_step >= 1 else '#AAAAAA'
+            };">上傳照片</div>
+        </div>
+        <div style="flex: 1; height: 2px; background: {
+            'linear-gradient(90deg, var(--primary-color), var(--secondary-color))' if current_step >= 2 else '#EEEEEE'
+        }; margin-top: 20px;"></div>
+        <div style="display: flex; flex-direction: column; align-items: center; flex: 1;">
+            <div style="width: 40px; height: 40px; border-radius: 50%; background: {
+                'linear-gradient(135deg, var(--primary-color), var(--secondary-color))' if current_step >= 2 else 'var(--neutral-light)'
+            }; display: flex; justify-content: center; align-items: center; color: white; font-weight: bold; margin-bottom: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1);">2</div>
+            <div style="text-align: center; font-size: 14px; color: {
+                'var(--neutral-dark)' if current_step >= 2 else '#AAAAAA'
+            };">分析中</div>
+        </div>
+        <div style="flex: 1; height: 2px; background: {
+            'linear-gradient(90deg, var(--primary-color), var(--secondary-color))' if current_step >= 3 else '#EEEEEE'
+        }; margin-top: 20px;"></div>
+        <div style="display: flex; flex-direction: column; align-items: center; flex: 1;">
+            <div style="width: 40px; height: 40px; border-radius: 50%; background: {
+                'linear-gradient(135deg, var(--primary-color), var(--secondary-color))' if current_step >= 3 else 'var(--neutral-light)'
+            }; display: flex; justify-content: center; align-items: center; color: white; font-weight: bold; margin-bottom: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1);">3</div>
+            <div style="text-align: center; font-size: 14px; color: {
+                'var(--neutral-dark)' if current_step >= 3 else '#AAAAAA'
+            };">查看結果</div>
+        </div>
+        <div style="flex: 1; height: 2px; background: {
+            'linear-gradient(90deg, var(--primary-color), var(--secondary-color))' if current_step >= 4 else '#EEEEEE'
+        }; margin-top: 20px;"></div>
+        <div style="display: flex; flex-direction: column; align-items: center; flex: 1;">
+            <div style="width: 40px; height: 40px; border-radius: 50%; background: {
+                'linear-gradient(135deg, var(--primary-color), var(--secondary-color))' if current_step >= 4 else 'var(--neutral-light)'
+            }; display: flex; justify-content: center; align-items: center; color: white; font-weight: bold; margin-bottom: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1);">4</div>
+            <div style="text-align: center; font-size: 14px; color: {
+                'var(--neutral-dark)' if current_step >= 4 else '#AAAAAA'
+            };">下載報告</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    col1, col2 = st.columns([3, 7])
+
+    with col1:
+        with st.container():
+            st.markdown('<div class="card">', unsafe_allow_html=True)
+            st.header("上傳影像")
+            uploaded_file = st.file_uploader("選擇面部照片", type=["jpg", "jpeg", "png"])
+            if uploaded_file:
+                image = PILImage.open(uploaded_file)
+                st.session_state["image"] = image  # 保存图片到 session state
+                st.image(image, caption="已上傳照片", use_container_width=True)
+                if st.button("開始分析"):
+                    # 更新當前步驟為"分析中"
+                    st.session_state["current_step"] = 2
+                    
+                    with st.spinner("正在分析影像..."):
+                        progress_bar = st.progress(0)
+                        
+                        # 分析步驟提示
+                        analysis_steps = [
+                            "正在初始化面部識別模型...",
+                            "檢測面部特徵點...",
+                            "分析膚質狀態...",
+                            "評估皮膚紋理...",
+                            "檢測色素沉著情況...",
+                            "分析皺紋深度與分佈...",
+                            "評估面部輪廓與對稱性...",
+                            "計算面部黃金比例...",
+                            "生成面部問題熱力圖...",
+                            "制定個性化治療方案..."
+                        ]
+                        
+                        status_text = st.empty()
+                        
+                        for i in range(100):
+                            # 更新進度條
+                            progress_bar.progress(i + 1)
+                            
+                            # 顯示當前分析步驟
+                            step_index = min(int(i / 10), len(analysis_steps) - 1)
+                            status_text.markdown(f"""
+                            <div style="padding: 10px; border-radius: 8px; background-color: var(--primary-light); margin-bottom: 10px;">
+                                <p style="margin: 0; color: var(--neutral-dark); font-size: 14px;">
+                                    <strong>當前步驟：</strong> {analysis_steps[step_index]}
+                                </p>
+                                <p style="margin: 5px 0 0 0; color: var(--neutral-dark); font-size: 12px; opacity: 0.8;">
+                                    總進度: {i+1}%
+                                </p>
+                            </div>
+                            """, unsafe_allow_html=True)
+                            
+                            # 模擬進度
+                            time.sleep(0.05)
+                        
+                        analysis_result = analyze_image(uploaded_file)
+                        # 清除進度條和狀態文本
+                        progress_bar.empty()
+                        status_text.empty()
+                        
+                        if analysis_result["status"] == "success":
+                            report = generate_report(analysis_result["data"])
+                            heatmap_path, radar_path, priority_path = create_visualizations(
+                                image, analysis_result["data"], report
+                            )
+                            st.session_state["analysis_result"] = analysis_result["data"]
+                            st.session_state["report"] = report
+                            st.session_state["heatmap_path"] = heatmap_path
+                            st.session_state["radar_path"] = radar_path
+                            st.session_state["priority_path"] = priority_path
+                            
+                            # 更新當前步驟
+                            st.session_state["current_step"] = 3
+                            
+                            st.success("分析完成！")
+                        else:
+                            st.error(f"分析失敗: {analysis_result['error']}")
+            st.markdown('</div>', unsafe_allow_html=True)
+
+    with col2:
+        with st.container():
+            st.markdown('<div class="card result-card">', unsafe_allow_html=True)
+            if "analysis_result" in st.session_state and "image" in st.session_state:  # 检查两个必要的键是否存在
+                st.header("分析結果與治療建議")
+                st.subheader("面部分析")
+                st.write(st.session_state["analysis_result"])
+
+                with st.spinner("正在生成治療建議..."):
+                    report = generate_report(st.session_state["analysis_result"])
+                    heatmap_path, radar_path, priority_path = create_visualizations(
+                        st.session_state["image"], st.session_state["analysis_result"], report
+                    )
+                    st.session_state["report"] = report
+                    st.session_state["heatmap_path"] = heatmap_path
+                    st.session_state["radar_path"] = radar_path
+                    st.session_state["priority_path"] = priority_path
+                    st.success("建議生成完成！")
+
+                st.subheader("治療方案建議")
+                st.markdown(st.session_state["report"])
+                col_vis1, col_vis2 = st.columns(2)
+                with col_vis1:
+                    if st.session_state["heatmap_path"]:
+                        st.markdown('<div class="chart-container">', unsafe_allow_html=True)
+                        st.markdown('<div class="chart-title">面部問題熱力圖</div>', unsafe_allow_html=True)
+                        st.image(st.session_state["heatmap_path"], use_container_width=True)
+                        st.markdown('</div>', unsafe_allow_html=True)
+                    if st.session_state["radar_path"]:
+                        st.markdown('<div class="chart-container">', unsafe_allow_html=True)
+                        st.markdown('<div class="chart-title">面部狀況評分</div>', unsafe_allow_html=True)
+                        st.image(st.session_state["radar_path"], use_container_width=True)
+                        st.markdown('</div>', unsafe_allow_html=True)
+                with col_vis2:
+                    if st.session_state["priority_path"]:
+                        st.markdown('<div class="chart-container">', unsafe_allow_html=True)
+                        st.markdown('<div class="chart-title">治療方案優先級</div>', unsafe_allow_html=True)
+                        st.image(st.session_state["priority_path"], use_container_width=True)
+                        st.markdown('</div>', unsafe_allow_html=True)
+            else:
+                st.header("分析結果與治療建議")
+                st.write("請先上傳照片並進行分析。")
+            st.markdown('</div>', unsafe_allow_html=True)
+
+    with st.container():
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.header("報告導出")
+        if "report" in st.session_state:
+            # 确保图片路径存在
+            image_paths = []
+            for path_key in ["heatmap_path", "radar_path", "priority_path"]:
+                path = st.session_state.get(path_key)
+                if path and os.path.exists(path):
+                    image_paths.append(path)
+                else:
+                    logger.warning(f"图片路径不存在: {path_key}")
+            
+            # 添加PDF下载按钮
+            if image_paths:  # 只要有图片就可以生成PDF
+                col_pdf1, col_pdf2 = st.columns([1, 1])
+                
+                with col_pdf1:
+                    st.markdown('<div style="text-align: center; padding: 10px;">', unsafe_allow_html=True)
+                    st.markdown('#### 標準報告')
+                    st.markdown('包含詳細分析結果和治療建議')
+                    with st.spinner("正在生成PDF報告..."):
+                        pdf_path = generate_simple_pdf(st.session_state["report"], image_paths)
+                        if pdf_path and os.path.exists(pdf_path):
+                            with open(pdf_path, "rb") as f:
+                                pdf_bytes = f.read()
+                            st.download_button(
+                                label="下載標準報告 📄",
+                                data=pdf_bytes,
+                                file_name="醫美診所評估報告.pdf",
+                                mime="application/pdf",
+                                key="standard_report"
+                            )
+                    st.markdown('</div>', unsafe_allow_html=True)
+                
+                with col_pdf2:
+                    st.markdown('<div style="text-align: center; padding: 10px;">', unsafe_allow_html=True)
+                    st.markdown('#### 高級報告')
+                    st.markdown('包含更多視覺化圖表和專業建議')
+                    with st.spinner("正在生成高級PDF報告..."):
+                        premium_pdf_path = generate_better_pdf(st.session_state["report"], image_paths)
+                        if premium_pdf_path and os.path.exists(premium_pdf_path):
+                            with open(premium_pdf_path, "rb") as f:
+                                premium_pdf_bytes = f.read()
+                            st.download_button(
+                                label="下載高級報告 📊",
+                                data=premium_pdf_bytes,
+                                file_name="醫美診所高級評估報告.pdf",
+                                mime="application/pdf",
+                                key="premium_report"
+                            )
+                    st.markdown('</div>', unsafe_allow_html=True)
+                
+                # 添加報告使用提示
+                st.markdown("""
+                <div style="background-color: var(--primary-light); padding: 15px; border-radius: 10px; margin-top: 20px;">
+                    <p style="font-size: 14px; color: var(--neutral-dark);">
+                        <strong>💡 提示：</strong> 報告僅供參考，建議攜帶報告前往專業醫美診所進行面對面諮詢。
+                        您可以使用此報告與醫生討論最適合您的治療方案。
+                    </p>
+                </div>
+                """, unsafe_allow_html=True)
+            else:
+                st.warning("無法生成報告：缺少必要的分析圖像。")
+        else:
+            st.info("請先完成面部分析以生成報告。")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+def process_analysis(image_file):
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        analysis_future = executor.submit(analyze_image, image_file)
+        analysis_result = analysis_future.result()
+        
+        if analysis_result["status"] == "success":
+            report_future = executor.submit(generate_report, analysis_result["data"])
+            report = report_future.result()
+            # 處理其他後續邏輯...
+
+def save_analysis(user_id, image_path, analysis_result, report):
+    conn = sqlite3.connect('medical_analysis.db')
+    c = conn.cursor()
+    c.execute('''
+        INSERT INTO analysis_results 
+        (user_id, timestamp, image_path, analysis_json, report_text) 
+        VALUES (?, ?, ?, ?, ?)
+    ''', (user_id, datetime.datetime.now(), image_path, json.dumps(analysis_result), report))
+    conn.commit()
+    conn.close()
+
+def detect_face_regions(image):
+    """检测面部区域，返回各区域的坐标"""
+    # 简化实现，返回基本区域划分
+    h, w = np.array(image).shape[:2]
+    
+    # 基于图像尺寸的简单区域划分
+    forehead = (int(h*0.1), int(h*0.3), int(w*0.3), int(w*0.7))  # 额头区域
+    eyes = (int(h*0.3), int(h*0.4), int(w*0.2), int(w*0.8))      # 眼周区域
+    nose = (int(h*0.4), int(h*0.6), int(w*0.4), int(w*0.6))      # 鼻子区域
+    cheeks = (int(h*0.4), int(h*0.7), int(w*0.2), int(w*0.8))    # 颊骨区域
+    lips = (int(h*0.6), int(h*0.7), int(w*0.3), int(w*0.7))      # 嘴唇区域
+    chin = (int(h*0.7), int(h*0.9), int(w*0.3), int(w*0.7))      # 下巴区域
+    
+    return {
+        "額頭": forehead,
+        "眼周": eyes,
+        "鼻子": nose,
+        "頰骨": cheeks,
+        "嘴唇": lips,
+        "下巴": chin
+    }
+
+if __name__ == "__main__":
+    main()
