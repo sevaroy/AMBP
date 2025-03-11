@@ -18,3 +18,4 @@ dlib
 fpdf2
 fonttools
 plotly
+kaleido
